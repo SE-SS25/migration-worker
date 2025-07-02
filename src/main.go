@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"github.com/goforj/godump"
+	"github.com/jackc/pgx/v5/pgxpool"
+	goutils "github.com/linusgith/goutils/pkg/env_utils"
+	database "github.com/linusgith/migration-worker/src/database/postgres/reader"
 	"github.com/linusgith/migration-worker/src/utils"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -11,6 +14,15 @@ import (
 	"os"
 	"time"
 )
+
+type MigrationWorker struct {
+	uuid       string //is assigned through an env variable by the controller
+	logger     *zap.Logger
+	writer     *database.Writer
+	reader     *database.Reader
+	writerPerf *database.WriterPerfectionist
+	readerPerf *database.ReaderPerfectionist
+}
 
 func createProductionLogger() *zap.Logger {
 	stdout := zapcore.AddSync(os.Stdout)
@@ -70,6 +82,35 @@ func createDevelopmentLogger() *zap.Logger {
 	return logger
 }
 
+func setupStructs(pool *pgxpool.Pool, logger *zap.Logger) MigrationWorker {
+
+	reader := database.Reader{
+		Pool:   pool,
+		Logger: logger,
+	}
+
+	writer := database.Writer{
+		Pool:   pool,
+		Logger: logger,
+	}
+
+	readerPerf := database.NewReaderPerfectionist(&reader)
+
+	writerPerf := database.NewWriterPerfectionist(&writer)
+
+	migrationMonster := MigrationWorker{
+		uuid:       goutils.ParseEnvDuration("UUID"), //TODO use panic
+		logger:     logger,
+		reader:     &reader,
+		writer:     &writer,
+		writerPerf: writerPerf,
+		readerPerf: readerPerf,
+	}
+
+	return migrationMonster
+
+}
+
 func main() {
 
 	//Setting a context without a timeout since this main function should (optimally) run forever
@@ -104,3 +145,21 @@ func main() {
 		return
 		//TODO retries
 	}
+
+	mm := setupStructs(pool, logger)
+
+	//TODO implement a loop where the m_worker looks in the db for a job with its id, then completes it and then looks again. if there are no new jobs in x (maybe 30ish) seconds it will shut down
+
+	for {
+		//since there is no limit to the backoff, if this fails over and over, we won't get anywhere
+		//TODO either change functionality here or handle this in the controller
+		job, getJobErr := mm.readerPerf.GetMigrationJob(ctx, mm.uuid)
+		if getJobErr != nil {
+			logger.Fatal("could not get migration job", zap.Error(err))
+		}
+
+		//TODO migration logic here
+
+	}
+
+}
