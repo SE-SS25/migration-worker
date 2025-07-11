@@ -1,19 +1,10 @@
 package utils
 
 import (
-	"errors"
 	"go.uber.org/zap"
 	"os"
 	"time"
 )
-
-func parseIdFromEnv(variableName string) error {
-	value := os.Getenv(variableName)
-
-	if value == "" {
-		return errors.New("id variable provided by the controller is empty")
-	}
-}
 
 func ParseEnvStringWithDefault(env string, defaultValue string, logger *zap.Logger) string {
 	envString := os.Getenv(env)
