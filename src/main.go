@@ -143,13 +143,12 @@ func main() {
 	go checkDeleted(ctx, mm)
 	go mm.Heartbeat(ctx)
 
-	err = runMigrationLoop(ctx, mm)
+	err = runMigration(ctx, mm)
 	if err != nil {
 		logger.Fatal("the migration loop failed and emitted an error", zap.Error(err))
 	}
 
 	//Remove self from the migration workers table and then shut down
-
 	err = mm.writerPerf.RemoveSelf(ctx, mm.uuid)
 	if err != nil {
 		logger.Fatal("could not remove self from the migration workers table", zap.Error(err))
@@ -159,66 +158,76 @@ func main() {
 	os.Exit(0)
 }
 
-func runMigrationLoop(ctx context.Context, mm MigrationWorker) error {
+func runMigration(ctx context.Context, mm MigrationWorker) error {
 
-	retries := goutils.Log().ParseEnvIntDefault("RETRIES", 5, mm.logger)
-	first := true
+	job, getJobErr := mm.readerPerf.GetMigrationJob(ctx, mm.uuid)
+	if errors.Is(getJobErr, pgx.ErrNoRows) {
 
-	for i := 0; i < retries; i++ {
-		if i != 0 {
-			time.Sleep(5 * time.Second)
-		}
-		//since there is no limit to the backoff, if this fails over and over, we won't get anywhere
-		//TODO either change functionality here or handle this in the controller
-		job, getJobErr := mm.readerPerf.GetMigrationJob(ctx, mm.uuid)
-		if errors.Is(getJobErr, pgx.ErrNoRows) {
-			if first {
-				mm.logger.Warn("migration worker was started but there is no available job", zap.String("m_worker_id", mm.uuid))
-				first = false
-			} else {
-				mm.logger.Info("there is no available job for this migration worker", zap.String("m_worker_id", mm.uuid))
-			}
+		mm.logger.Info("there is no available job for this migration worker", zap.String("m_worker_id", mm.uuid))
 
-			//go to next iteration and check if there is a job now
-			continue
-		}
-		if getJobErr != nil {
-			mm.logger.Error("could not get migration job, but error was not 'no rows'", zap.Error(getJobErr))
-			return getJobErr
-		}
+	}
+	if getJobErr != nil {
+		mm.logger.Error("could not get migration job, but error was not 'no rows'", zap.Error(getJobErr))
+		return getJobErr
+	}
 
-		err := mm.writerPerf.UpdateJobStatus(ctx, mm.uuid, utils.Running)
-		if err != nil {
-			mm.logger.Error("migration worker took job but could not update the db state", zap.String("workerId", mm.uuid), zap.String("state", string(utils.Running)))
-			return err
-		}
+	//if job is 'failed', 'done' (but not removed), 'running' (but not set running by this instance) we enter failure mode
+	if job.Status != "waiting" {
+		mm.failureMode = true
+	}
 
-		originCli, destCli, prepErr := mm.PrepareMigration(ctx, job)
-		if prepErr != nil {
-			mm.logger.Error("preparing migration failed", zap.String("migrationId", job.ID.String()))
-			return prepErr
-		}
+	//prepare
+	err := mm.writerPerf.UpdateJobStatus(ctx, mm.uuid, utils.Running)
+	if err != nil {
+		mm.logger.Error("migration worker took job but could not update the db state", zap.String("workerId", mm.uuid), zap.String("state", string(utils.Running)))
+		return err
+	}
 
-		//execute migration
+	originCli, destCli, prepErr := mm.PrepareMigration(ctx, job)
+	if prepErr != nil {
+		mm.logger.Error("preparing migration failed", zap.String("migrationId", job.ID.String()), zap.Error(prepErr))
+		return prepErr
+	}
 
-		newStatus := utils.Done
+	//execute
+	execErr := mm.Migrate(ctx, originCli, destCli, job)
+	if execErr != nil {
+		mm.logger.Error("error occurred running the migration", zap.String("jobId", job.ID.String()))
+	}
 
-		execErr := mm.RunMigration(ctx, originCli, destCli, job)
-		if execErr != nil {
-			mm.logger.Error("error occurred running the migration", zap.String("jobId", job.ID.String()))
-			newStatus = utils.Failed
-		}
+	mm.logger.Info("migration worker finished running the migration", zap.String("jobId", job.ID.String()), zap.String("workerId", mm.uuid))
 
-		//update the status
-		err = mm.writerPerf.UpdateJobStatus(ctx, mm.uuid, newStatus)
-		if err != nil {
-			mm.logger.Error("could not update the job status to new state", zap.String("jobId", job.ID.String()), zap.String("newStatus", string(newStatus)))
-			return err
-		}
+	//cleanup
+	err = mm.writerPerf.RemoveJob(ctx, mm.uuid)
+	if err != nil {
+		mm.logger.Error("could not update the job status to new state", zap.String("jobId", job.ID.String()))
+		return err
+	}
 
-		//reset the counter if migration was found and successful
-		i = 0
+	mm.logger.Info("migration worker successfully removed the job from the migration workers table", zap.String("jobId", job.ID.String()), zap.String("workerId", mm.uuid))
 
+	//TODO change db_mappings table accordingly
+
+	mappings, err := mm.readerPerf.GetAllMappings(ctx)
+	if err != nil {
+		return fmt.Errorf("could not get all db mappings: %w", err)
+	}
+
+	//crete the new db mappings
+
+	err = mm.writerPerf.AddDbMapping(ctx, job.From, job.Url)
+	if err != nil {
+		return err
+	}
+
+	url, err := getOriginUrl(mappings, job)
+	if err != nil {
+		return fmt.Errorf("could not get origin url from mappings: %w", err)
+	}
+
+	err = mm.writerPerf.AddDbMapping(ctx, job.To, url)
+	if err != nil {
+		return fmt.Errorf("could not add db mapping for destination: %w", err)
 	}
 
 	return nil

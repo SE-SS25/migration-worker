@@ -10,7 +10,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.uber.org/zap"
+	"log"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,12 +21,13 @@ import (
 )
 
 type MigrationWorker struct {
-	uuid       string //is assigned through an env variable by the controller
-	logger     *zap.Logger
-	writer     *postgres.Writer
-	reader     *postgres.Reader
-	writerPerf *postgres.WriterPerfectionist
-	readerPerf *postgres.ReaderPerfectionist
+	uuid        string //is assigned through an env variable by the controller
+	failureMode bool
+	logger      *zap.Logger
+	writer      *postgres.Writer
+	reader      *postgres.Reader
+	writerPerf  *postgres.WriterPerfectionist
+	readerPerf  *postgres.ReaderPerfectionist
 }
 
 type Document bson.Raw
@@ -79,18 +82,9 @@ func (mm *MigrationWorker) PrepareMigration(ctx context.Context, job sqlc.DbMigr
 		return &mongo.Client{}, &mongo.Client{}, err
 	}
 
-	var urlForRange string
-
-	for _, mp := range mappings {
-
-		mm.logger.Debug("comparing job from to beginning of ranges", zap.String("jobFrom", job.From), zap.String("mappingFrom", mp.From))
-
-		//if the 'from' of the current range is smaller than or equal to the 'from' of the job range, we know, that we are on the correct origin db
-		if mp.From <= job.From {
-			urlForRange = mp.Url
-			break
-		}
-
+	urlForRange, err := getOriginUrl(mappings, job)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	if urlForRange == "" {
@@ -111,16 +105,34 @@ func (mm *MigrationWorker) PrepareMigration(ctx context.Context, job sqlc.DbMigr
 		return &mongo.Client{}, &mongo.Client{}, err
 	}
 
-	err = prepareDbForMigration(ctx, originCli, destCli, job)
+	err = prepareDbForMigration(ctx, originCli, destCli, job, mm.logger, mm.failureMode)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("error occurred preparing the metadata for the new database: %v", err)
 	}
 
 	return originCli, destCli, nil
 
 }
 
-func (mm *MigrationWorker) RunMigration(ctx context.Context, originCli, destCli *mongo.Client, job sqlc.DbMigration) error {
+func getOriginUrl(mappings []sqlc.DbMapping, job sqlc.DbMigration) (string, error) {
+	var urlForRange string
+
+	for i, mp := range mappings {
+
+		//if the 'from' of the current range is smaller than or equal to the 'from' of the job range, we know, that we are on the correct origin db
+		if mp.From >= job.From {
+			if i == 0 {
+				return "", fmt.Errorf("somehow the beginning of the range that should be migrated was before 'a' -> user issue: not supported; sucks to suck")
+			}
+			urlForRange = mappings[i-1].Url
+			break
+		}
+
+	}
+	return urlForRange, nil
+}
+
+func (mm *MigrationWorker) Migrate(ctx context.Context, originCli, destCli *mongo.Client, job sqlc.DbMigration) error {
 
 	dbNames, listErr := originCli.ListDatabaseNames(ctx, bson.D{})
 	if listErr != nil {
@@ -136,37 +148,107 @@ func (mm *MigrationWorker) RunMigration(ctx context.Context, originCli, destCli 
 		if name >= job.From && name < job.To {
 			var wg sync.WaitGroup
 
-			go func() {
-				wg.Add(1)
+			if name == "admin" || name == "config" || name == "local" {
+				continue
+			}
+
+			wg.Add(1)
+
+			go func(dbName string) {
 				defer wg.Done()
 
 				mongoDbOrigin := originCli.Database(name)
-
-				collectionList, err := createCollectionStructs(ctx, mongoDbOrigin)
-				if err != nil {
-					panic(err)
-				}
-
-				collections, err := readCollectionsFromDb(ctx, mongoDbOrigin, collectionList)
-				if err != nil {
-					panic(err)
-				}
-
-				//readPanicMsg := recover() //TODO
-				//mm.logger.Error("panic occurred when running migration (reading from old)", zap.Any("msg", readPanicMsg))
-
 				mongoDbDest := destCli.Database(name)
-				err = writeCollectionsToNewDb(ctx, mongoDbDest, collections)
+
+				collectionList, err := createCollectionStructs(ctx, mongoDbOrigin, mm.logger)
 				if err != nil {
 					panic(err)
 				}
 
-				// Wait for all goroutines to finish
-				wg.Wait()
+				for i, j := 0, len(collectionList)-1; i < j; i, j = i+1, j-1 {
+					collectionList[i], collectionList[j] = collectionList[j], collectionList[i]
+				}
 
-				//writePanicMsg := recover()
-				//mm.logger.Error("panic occurred when running migration (writing to new)", zap.Any("msg", writePanicMsg))
-			}()
+				maximum, err := getMaxCollForDb(ctx, mongoDbDest)
+				if err != nil {
+					return
+				}
+
+				for _, collStruct := range collectionList {
+
+					mm.logger.Debug("moving collection for database", zap.String("database", name), zap.String("collection", collStruct.collectionName))
+
+					col := mongoDbOrigin.Collection(collStruct.collectionName)
+
+					mm.logger.Debug("got origin collection", zap.String("collection", collStruct.collectionName))
+
+					cursor, err := col.Find(ctx, &bson.D{})
+					if err != nil {
+						return
+					}
+
+					allCollections, err := mongoDbDest.ListCollectionNames(ctx, &bson.D{})
+					if err != nil {
+						mm.logger.Error("could not get collection names from destination database", zap.String("database", name), zap.Error(err))
+						return
+					}
+
+					if slices.Contains(allCollections, collStruct.collectionName) && mm.failureMode {
+						err = mongoDbDest.Collection(collStruct.collectionName).Drop(ctx)
+						if err != nil {
+							mm.logger.Error("could not drop collection in destination database", zap.String("collection", collStruct.collectionName), zap.Error(err))
+							return
+						}
+					}
+
+					for cursor.Next(ctx) {
+
+						mm.logger.Debug("found document in collection", zap.String("collection", collStruct.collectionName))
+
+						if collStruct.number > maximum {
+							_, err := mongoDbDest.Collection("chat"+strconv.Itoa(maximum)).InsertOne(ctx, append([]byte{}, cursor.Current...))
+							if err != nil {
+								return
+							}
+
+							mm.logger.Debug("executing special case for collection", zap.String("collection", collStruct.collectionName))
+
+							continue
+						}
+
+						_, err := destCli.Database(name).Collection(collStruct.collectionName).InsertOne(ctx, append([]byte{}, cursor.Current...))
+						if err != nil {
+							return
+						}
+
+						mm.logger.Debug("inserted document successfully", zap.String("collection", collStruct.collectionName))
+
+					}
+
+					mm.logger.Debug("inserted all documents for collection", zap.String("collection", collStruct.collectionName), zap.Int("len", len(collStruct.documentList)))
+
+					err = originCli.Database(name).Collection(collStruct.collectionName).Drop(ctx)
+					if err != nil {
+						mm.logger.Error("could not drop collection", zap.String("collection", collStruct.collectionName), zap.Error(err))
+						return
+					}
+
+				}
+
+				mm.logger.Debug("done migrating the database", zap.String("database", name))
+
+				err = originCli.Database(name).Drop(ctx)
+				if err != nil {
+					return
+				}
+
+				mm.logger.Debug("successfully dropped database", zap.String("database", name))
+			}(name)
+
+			//Wait for all goroutines to finish
+			wg.Wait()
+
+			mm.logger.Debug("All goroutines are done, continuing")
 
 		}
 	}
@@ -175,9 +257,44 @@ func (mm *MigrationWorker) RunMigration(ctx context.Context, originCli, destCli 
 
 }
 
+func (mm *MigrationWorker) CleanupMigration(ctx context.Context, originCli *mongo.Client, job sqlc.DbMigration) error {
+
+	mm.logger.Debug("starting cleanup of migration", zap.String("jobId", job.ID.String()))
+
+	dbNames, listErr := originCli.ListDatabaseNames(ctx, bson.D{})
+	if listErr != nil {
+		return listErr
+	}
+
+	//sort the names so that we can go through them and determine which databases should be migrated
+	sort.Strings(dbNames)
+
+	for _, name := range dbNames {
+
+		if name >= job.From && name < job.To {
+
+			if name == "admin" || name == "config" || name == "local" {
+				continue
+			}
+
+			err := originCli.Database(name).Drop(ctx)
+			if err != nil {
+				return fmt.Errorf("could not drop database %s: %v", name, err)
+			}
+
+			mm.logger.Debug("successfully dropped database", zap.String("database", name))
+
+		}
+
+	}
+
+	return nil
+
+}
+
 // createCollectionStructs gets all collections from a database and assigns every one a channel over which the data that is read from the reader of the origin database can be transferred to the writer of the destination other database.
 // It then saves all channels in a sync.Map with the collection name. That map is then stored in another sync.Map that maps from the database to its collections.
-func createCollectionStructs(ctx context.Context, mongoDb *mongo.Database) ([]collectionStruct, error) {
+func createCollectionStructs(ctx context.Context, mongoDb *mongo.Database, logger *zap.Logger) ([]collectionStruct, error) {
 
 	collNames, err := mongoDb.ListCollectionNames(ctx, bson.D{})
 	if err != nil {
@@ -188,6 +305,8 @@ func createCollectionStructs(ctx context.Context, mongoDb *mongo.Database) ([]co
 	if err != nil {
 		return nil, err
 	}
+
+	logger.Debug("successfully sorted collections for db", zap.String("dbName", mongoDb.Name()))
 
 	var collDocuList []collectionStruct
 
@@ -203,6 +322,11 @@ func createCollectionStructs(ctx context.Context, mongoDb *mongo.Database) ([]co
 			return nil, err
 		}
 
+		//'chat0' is the metadata, and we have already added it to the db
+		if num == 0 {
+			continue
+		}
+
 		collections := collectionStruct{
 			number:         num,
 			collectionName: s,
@@ -211,64 +335,11 @@ func createCollectionStructs(ctx context.Context, mongoDb *mongo.Database) ([]co
 
 		collDocuList = append(collDocuList, collections)
 
+		logger.Debug("appended collectionStruct to list", zap.String("collName", s), zap.Int("number", num))
 	}
 
 	return collDocuList, nil
 
-}
-
-// readCollectionsFromDb starts a goroutine for every collection and writes the data from that collection into the corresponding channel
-func readCollectionsFromDb(ctx context.Context, mongoDb *mongo.Database, collList []collectionStruct) ([]collectionStruct, error) {
-
-	for _, collection := range collList {
-
-		col := mongoDb.Collection(collection.collectionName)
-
-		cursor, err := col.Find(ctx, &bson.D{})
-		if err != nil {
-			return nil, err
-		}
-
-		for cursor.Next(ctx) {
-			collection.documentList = append(collection.documentList, Document(cursor.Current))
-		}
-
-	}
-
-	return collList, nil
-
-}
-
-func writeCollectionsToNewDb(ctx context.Context, mongoDb *mongo.Database, collList []collectionStruct) error {
-
-	//this reverses the list
-	for i, j := 0, len(collList)-1; i < j; i, j = i+1, j-1 {
-		collList[i], collList[j] = collList[j], collList[i]
-	}
-
-	//first write the metadata
-	metadataDoc := collList[len(collList)-1]
-
-	metadataColl := mongoDb.Collection(metadataDoc.collectionName)
-	_, err := metadataColl.InsertOne(ctx, bson.Raw(metadataDoc.documentList[0]))
-	if err != nil {
-		return err
-	}
-
-	collList = collList[0 : len(collList)-1]
-
-	for _, collection := range collList {
-
-		coll := mongoDb.Collection(collection.collectionName)
-
-		_, err = coll.InsertMany(ctx, collection.documentList)
-		if err != nil {
-			return err
-		}
-
-	}
-
-	return nil
 }
 
 type infoOnDatabase struct {
@@ -277,34 +348,49 @@ type infoOnDatabase struct {
 	metadataDoc       Document
 }
 
-func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Client, migration sqlc.DbMigration) error {
+// prepareDbForMigration first gets the metadata collection for every database and the highest collection and transfers these infos to the migration goal db
+func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Client, migration sqlc.DbMigration, logger *zap.Logger, failureMode bool) error {
 
 	names, err := ogClient.ListDatabaseNames(ctx, &bson.D{})
 	if err != nil {
 		return err
 	}
 
-	metadataList := make([]infoOnDatabase, len(names))
+	logger.Debug("got all databases", zap.Int("count", len(names)))
+
+	metadataList := make([]infoOnDatabase, 0, len(names))
 
 	for _, name := range names {
 
-		if name >= migration.To && name < migration.From {
+		if name >= migration.To || name < migration.From {
+			logger.Debug("database does not belong to range", zap.String("db", name), zap.String("from", migration.From), zap.String("to", migration.To))
+			continue
+		}
+
+		if name == "admin" || name == "config" || name == "date" {
 			continue
 		}
 
 		coll := ogClient.Database(name).Collection("chat0")
+
+		logger.Debug("got collection 'chat0' for database", zap.String("db", name))
 
 		cursor, err := coll.Find(ctx, &bson.D{})
 		if err != nil {
 			return err
 		}
 
+		logger.Debug("successfully got cursor for database", zap.String("db", name))
+
+		//taking the first document out of the collection, this does NOT work if every user is one document
 		ok := cursor.Next(ctx)
 		if !ok {
-			fmt.Errorf("could not find metadata document")
+			return fmt.Errorf("could not find metadata document with name '%s' for db %s", "chat0", name)
 		}
 
-		metadataBson := cursor.Current
+		metadataBson := append([]byte{}, cursor.Current...)
+
+		logger.Debug("successfully got bytes for metadata")
 
 		cNames, err := ogClient.Database(name).ListCollectionNames(ctx, &bson.D{})
 		if err != nil {
@@ -314,6 +400,13 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 		sorted, err := sortCollectionsByName(cNames)
 		if err != nil {
 			return err
+		}
+
+		logger.Debug("successfully sorted the database names")
+
+		//this theoretically should not happen because if there is a database there should always be chat0 in it even if there are no messages
+		if len(sorted) == 0 {
+			return fmt.Errorf("there are no collections with the right schema in this database: %s -> (specifically chat0 is missing)", name)
 		}
 
 		highestColl, ok := strings.CutPrefix(sorted[len(sorted)-1], "chat")
@@ -334,19 +427,77 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 			metadataDoc:       Document(metadataBson),
 		})
 
+		logger.Debug("successfully appended info to metadatList", zap.String("dbName", name), zap.Int("maximum", maximum), zap.Int("metadataLength", len(metadataBson)))
+
+	}
+
+	logger.Info("successfully read all metadata from origin, attempting to write to destination now")
+
+	goalNames, err := goalClient.ListDatabaseNames(ctx, &bson.D{})
+	if err != nil {
+		return err
 	}
 
 	for _, elem := range metadataList {
 
 		db := goalClient.Database(elem.dbName)
-		_, err := db.Collection("chat0").InsertOne(ctx, elem.metadataDoc)
+
+		if slices.Contains(goalNames, elem.dbName) && failureMode {
+
+			logger.Warn("in failure mode and we have already transferred this db", zap.String("dbName", elem.dbName))
+
+			//if db already exists, and we are in failure mode, we delete the metadata doc and write it again since we don't know if it worked last time
+			dropErr := db.Collection("chat0").Drop(ctx)
+			if dropErr != nil {
+				return dropErr
+			}
+
+		}
+
+		logger.Debug("successfully got database on destination instance", zap.String("name", elem.dbName))
+
+		var parsed bson.D
+
+		err := bson.Unmarshal(elem.metadataDoc, &parsed)
+		if err != nil {
+			return fmt.Errorf("error unmarshaling the metadata into bson.D: %v", err)
+		}
+
+		logger.Debug("successfully unmarshaled metadata for database", zap.String("name", elem.dbName))
+
+		_, err = db.Collection("chat0").InsertOne(ctx, parsed)
 		if err != nil {
 			return err
 		}
-		_, err = db.Collection("chat"+strconv.Itoa(elem.highestCollection)).InsertOne(ctx, bson.Raw("delete_me"))
+
+		logger.Debug("successfully inserted metadata document into collection chat")
+
+		doc := bson.D{{Key: "dont_delete_me", Value: true}}
+
+		// Step 2: Marshal to BSON bytes
+		bytes, err := bson.Marshal(doc)
+		if err != nil {
+			log.Fatal("Failed to marshal:", err)
+		}
+
+		highestName := "chat" + strconv.Itoa(elem.highestCollection)
+		collNames, err := db.ListCollectionNames(ctx, &bson.D{})
 		if err != nil {
 			return err
 		}
+
+		//if the collection with the highest number does not exist, we create it
+		if !slices.Contains(collNames, highestName) {
+
+			_, err = db.Collection("chat"+strconv.Itoa(elem.highestCollection)).InsertOne(ctx, bson.Raw(bytes))
+			if err != nil {
+				return err
+			}
+			logger.Debug("successfully inserted starting collection into destination db", zap.String("collection", highestName))
+		}
+
+		logger.Debug("successfully inserted starting collection into destination db")
+
 	}
 
 	return nil
@@ -359,7 +510,7 @@ func sortCollectionsByName(names []string) ([]string, error) {
 
 	for _, s := range names {
 
-		if s == "admin" || s == "config" || s == "date" {
+		if s == "delete_me" {
 			continue
 		}
 
@@ -386,5 +537,44 @@ func sortCollectionsByName(names []string) ([]string, error) {
 	}
 
 	return sorted, nil
+
+}
+
+//func checkMessagePresent(ctx context.Context, mongoColl *mongo.Collection, doc bson.D) {
+//
+//	mongoColl.
+//
+//}
+
+func getMaxCollForDb(ctx context.Context, mongoDb *mongo.Database) (int, error) {
+
+	names, err := mongoDb.ListCollectionNames(ctx, &bson.D{})
+	if err != nil {
+		return 0, err
+	}
+
+	maximum := 0
+
+	for _, n := range names {
+		if !strings.HasPrefix(n, "chat") {
+			continue
+		}
+
+		numString, ok := strings.CutPrefix(n, "chat")
+		if !ok {
+			return 0, fmt.Errorf("could not cut prefix for %s", n)
+		}
+
+		num, err := strconv.Atoi(numString)
+		if err != nil {
+			return 0, err
+		}
+
+		if num > maximum {
+			maximum = num
+		}
+	}
+
+	return maximum, err
 
 }
