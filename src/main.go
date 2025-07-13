@@ -171,6 +171,8 @@ func runMigration(ctx context.Context, mm MigrationWorker) error {
 		return getJobErr
 	}
 
+	mm.logger.Info("got a job", zap.String("jobId", job.ID.String()), zap.String("workerId", mm.uuid), zap.Any("jobStatus", job.Status), zap.String("jobFrom", job.From), zap.String("jobTo", job.To), zap.String("jobUrl", job.Url))
+
 	//if job is 'failed', 'done' (but not removed), 'running' (but not set running by this instance) we enter failure mode
 	if job.Status != "waiting" {
 		mm.failureMode = true
@@ -208,27 +210,9 @@ func runMigration(ctx context.Context, mm MigrationWorker) error {
 
 	//TODO change db_mappings table accordingly
 
-	mappings, err := mm.readerPerf.GetAllMappings(ctx)
-	if err != nil {
-		return fmt.Errorf("could not get all db mappings: %w", err)
-	}
-
 	//crete the new db mappings
 
-	err = mm.writerPerf.AddDbMapping(ctx, job.From, job.Url)
-	if err != nil {
-		return err
-	}
-
-	url, err := getOriginUrl(mappings, job)
-	if err != nil {
-		return fmt.Errorf("could not get origin url from mappings: %w", err)
-	}
-
-	err = mm.writerPerf.AddDbMapping(ctx, job.To, url)
-	if err != nil {
-		return fmt.Errorf("could not add db mapping for destination: %w", err)
-	}
+	mm.CalculateNewMappings(ctx, job)
 
 	return nil
 }

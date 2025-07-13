@@ -82,7 +82,7 @@ func (mm *MigrationWorker) PrepareMigration(ctx context.Context, job sqlc.DbMigr
 		return &mongo.Client{}, &mongo.Client{}, err
 	}
 
-	urlForRange, err := getOriginUrl(mappings, job)
+	urlForRange, err := getOriginUrl(mappings, job, mm.logger)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -114,13 +114,14 @@ func (mm *MigrationWorker) PrepareMigration(ctx context.Context, job sqlc.DbMigr
 
 }
 
-func getOriginUrl(mappings []sqlc.DbMapping, job sqlc.DbMigration) (string, error) {
+func getOriginUrl(mappings []sqlc.DbMapping, job sqlc.DbMigration, logger *zap.Logger) (string, error) {
 	var urlForRange string
 
 	for i, mp := range mappings {
 
+		logger.Debug("comparing mapping", zap.String("mpFrom", mp.From), zap.String("jobFrom", job.From))
 		//if the 'from' of the current range is smaller than or equal to the 'from' of the job range, we know, that we are on the correct origin db
-		if mp.From >= job.From {
+		if mp.From > job.From {
 			if i == 0 {
 				return "", fmt.Errorf("somehow the beginning of the range that should be migrated was before 'a' -> user issue: not supported; sucks to suck")
 			}
@@ -206,7 +207,7 @@ func (mm *MigrationWorker) Migrate(ctx context.Context, originCli, destCli *mong
 						mm.logger.Debug("found document in collection", zap.String("collection", collStruct.collectionName))
 
 						if collStruct.number > maximum {
-							_, err := mongoDbDest.Collection("chat"+strconv.Itoa(maximum)).InsertOne(ctx, append([]byte{}, cursor.Current...))
+							_, err := mongoDbDest.Collection("chat_"+strconv.Itoa(maximum)).InsertOne(ctx, append([]byte{}, cursor.Current...))
 							if err != nil {
 								return
 							}
@@ -312,9 +313,9 @@ func createCollectionStructs(ctx context.Context, mongoDb *mongo.Database, logge
 
 	for _, s := range sorted {
 
-		numAsString, ok := strings.CutPrefix(s, "chat")
+		numAsString, ok := strings.CutPrefix(s, "chat_")
 		if !ok {
-			return nil, fmt.Errorf("prefix 'chat' not found in %s", s)
+			return nil, fmt.Errorf("prefix 'chat_' not found in %s", s)
 		}
 
 		num, convErr := strconv.Atoi(numAsString)
@@ -371,9 +372,9 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 			continue
 		}
 
-		coll := ogClient.Database(name).Collection("chat0")
+		coll := ogClient.Database(name).Collection("chat_0")
 
-		logger.Debug("got collection 'chat0' for database", zap.String("db", name))
+		logger.Debug("got collection 'chat_0' for database", zap.String("db", name))
 
 		cursor, err := coll.Find(ctx, &bson.D{})
 		if err != nil {
@@ -385,7 +386,7 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 		//taking the first document out of the collection, this does NOT work if every user is one document
 		ok := cursor.Next(ctx)
 		if !ok {
-			return fmt.Errorf("could not find metadata document with name '%s' for db %s", "chat0", name)
+			return fmt.Errorf("could not find metadata document with name '%s' for db %s", "chat_0", name)
 		}
 
 		metadataBson := append([]byte{}, cursor.Current...)
@@ -406,12 +407,12 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 
 		//this theoretically should not happen because if there is a database there should always be chat0 in it even if there are no messages
 		if len(sorted) == 0 {
-			return fmt.Errorf("there are no collections with the right schema in this database: %s -> (specifically chat0 is missing)", name)
+			return fmt.Errorf("there are no collections with the right schema in this database: %s -> (specifically chat_0 is missing)", name)
 		}
 
-		highestColl, ok := strings.CutPrefix(sorted[len(sorted)-1], "chat")
+		highestColl, ok := strings.CutPrefix(sorted[len(sorted)-1], "chat_")
 		if !ok {
-			return fmt.Errorf("prefix 'chat' not found in %s", sorted[len(sorted)-1])
+			return fmt.Errorf("prefix 'chat_' not found in %s", sorted[len(sorted)-1])
 		}
 
 		maximum, err := strconv.Atoi(highestColl)
@@ -447,7 +448,7 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 			logger.Warn("in failure mode and we have already transferred this db", zap.String("dbName", elem.dbName))
 
 			//if db already exists, and we are in failure mode, we delete the metadata doc and write it again since we don't know if it worked last time
-			dropErr := db.Collection("chat0").Drop(ctx)
+			dropErr := db.Collection("chat_0").Drop(ctx)
 			if dropErr != nil {
 				return dropErr
 			}
@@ -465,7 +466,7 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 
 		logger.Debug("successfully unmarshaled metadata for database", zap.String("name", elem.dbName))
 
-		_, err = db.Collection("chat0").InsertOne(ctx, parsed)
+		_, err = db.Collection("chat_0").InsertOne(ctx, parsed)
 		if err != nil {
 			return err
 		}
@@ -480,7 +481,7 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 			log.Fatal("Failed to marshal:", err)
 		}
 
-		highestName := "chat" + strconv.Itoa(elem.highestCollection)
+		highestName := "chat_" + strconv.Itoa(elem.highestCollection)
 		collNames, err := db.ListCollectionNames(ctx, &bson.D{})
 		if err != nil {
 			return err
@@ -489,7 +490,7 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 		//if the collection with the highest number does not exist, we create it
 		if !slices.Contains(collNames, highestName) {
 
-			_, err = db.Collection("chat"+strconv.Itoa(elem.highestCollection)).InsertOne(ctx, bson.Raw(bytes))
+			_, err = db.Collection("chat_"+strconv.Itoa(elem.highestCollection)).InsertOne(ctx, bson.Raw(bytes))
 			if err != nil {
 				return err
 			}
@@ -504,6 +505,35 @@ func prepareDbForMigration(ctx context.Context, ogClient, goalClient *mongo.Clie
 
 }
 
+func (mm *MigrationWorker) CalculateNewMappings(ctx context.Context, job sqlc.DbMigration) error {
+
+	//first get all mappings from the database
+	mappings, err := mm.readerPerf.GetAllMappings(ctx)
+	if err != nil {
+		return fmt.Errorf("could not get all db mappings: %w", err)
+	}
+
+	//set the range of the migration to where the range is now
+	err = mm.writerPerf.AddDbMapping(ctx, job.From, job.Url)
+	if err != nil {
+		return err
+	}
+
+	//get the url of where the migration came from
+	url, err := getOriginUrl(mappings, job, mm.logger)
+	if err != nil {
+		return fmt.Errorf("could not get origin url from mappings: %w", err)
+	}
+
+	//add the end of the migration range as the start of the new range
+	err = mm.writerPerf.AddDbMapping(ctx, job.To, url)
+	if err != nil {
+		return fmt.Errorf("could not add db mapping for destination: %w", err)
+	}
+
+	return nil
+}
+
 func sortCollectionsByName(names []string) ([]string, error) {
 
 	var numbers []int
@@ -514,9 +544,9 @@ func sortCollectionsByName(names []string) ([]string, error) {
 			continue
 		}
 
-		n, ok := strings.CutPrefix(s, "chat")
+		n, ok := strings.CutPrefix(s, "chat_")
 		if !ok {
-			return nil, fmt.Errorf("prefix 'chat' not found in %s", s)
+			return nil, fmt.Errorf("prefix 'chat_' not found in %s", s)
 		}
 		number, err := strconv.Atoi(n)
 		if err != nil {
@@ -533,7 +563,7 @@ func sortCollectionsByName(names []string) ([]string, error) {
 
 	for _, n := range numbers {
 
-		sorted = append(sorted, "chat"+strconv.Itoa(n))
+		sorted = append(sorted, "chat_"+strconv.Itoa(n))
 	}
 
 	return sorted, nil
@@ -556,11 +586,11 @@ func getMaxCollForDb(ctx context.Context, mongoDb *mongo.Database) (int, error) 
 	maximum := 0
 
 	for _, n := range names {
-		if !strings.HasPrefix(n, "chat") {
+		if !strings.HasPrefix(n, "chat_") {
 			continue
 		}
 
-		numString, ok := strings.CutPrefix(n, "chat")
+		numString, ok := strings.CutPrefix(n, "chat_")
 		if !ok {
 			return 0, fmt.Errorf("could not cut prefix for %s", n)
 		}

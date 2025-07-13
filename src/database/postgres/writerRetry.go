@@ -242,6 +242,7 @@ func (w *WriterPerfectionist) AddDbMapping(ctx context.Context, from, url string
 			return err
 		}
 
+		w.writer.Logger.Debug("addDbMapping retrying", zap.String("from", from), zap.String("url", url), zap.Error(oeErr.Err), zap.Duration("backoff", backoff))
 		backoffMs := backoff.Milliseconds()
 		newBackoffMs := int64(math.Pow(float64(backoffMs), count))
 		if newBackoffMs > w.maxBackoff.Milliseconds() {
